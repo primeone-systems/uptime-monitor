@@ -1,0 +1,80 @@
+# Outside uptime check. Runs every 5 minutes on GitHub, outside the server, so
+# it still works when the server is down. The addresses come from the secret
+# UPTIME_URLS (one per line) and are never printed. A failed run emails the
+# account that last changed this schedule.
+name: Uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+    - cron: '7 0 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime-${{ github.event.schedule == '7 0 1 * *' && 'keepalive' || 'check' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event.schedule != '7 0 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check
+        shell: bash
+        env:
+          URLS: ${{ secrets.UPTIME_URLS }}
+          ERROR_TEXT: ${{ secrets.UPTIME_ERROR_TEXT }}
+        run: |
+          set -u
+          if [ -z "$URLS" ]; then echo "::error::Secret UPTIME_URLS is empty"; exit 1; fi
+          probe() {
+            local url=$1 body code
+            body=$(mktemp)
+            code=$(curl -sS -L -o "$body" -m 30 -A 'Uptime/1.0' -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+            if [ "$code" != "200" ]; then echo "$code"; rm -f "$body"; return 1; fi
+            if [ -n "$ERROR_TEXT" ] && grep -qF "$ERROR_TEXT" "$body"; then echo "200 with an error page"; rm -f "$body"; return 1; fi
+            rm -f "$body"; echo "200"; return 0
+          }
+          failed=0; n=0
+          while IFS= read -r url; do
+            url=$(printf '%s' "$url" | tr -d '\r' | xargs)
+            [ -z "$url" ] && continue
+            n=$((n + 1))
+            if result=$(probe "$url"); then
+              echo "check $n: OK ($result)"
+            else
+              # one retry after 60 s, so a single slow answer does not page anyone
+              sleep 60
+              if result=$(probe "$url"); then
+                echo "check $n: OK on retry ($result)"
+              else
+                echo "::error title=Check $n failed::answered $result twice, 60 s apart"
+                failed=1
+              fi
+            fi
+          done <<< "$URLS"
+          exit $failed
+
+  # GitHub switches off scheduled workflows in a public repository with no commit
+  # for 60 days. On the 1st of each month this job records the date.
+  keepalive:
+    if: github.event.schedule == '7 0 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Monthly keepalive commit
+        shell: bash
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" repo
+          cd repo
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .keepalive
+          git commit -m 'Keepalive (monthly)' && git push
